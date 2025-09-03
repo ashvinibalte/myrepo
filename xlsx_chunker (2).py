@@ -41,6 +41,32 @@ from typing import Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# --- Strict-JSON sanitizer: replace NaN/Inf with None -----------------------
+import math
+
+def sanitize_for_json(obj):
+    """Recursively replace NaN/Infinity with None so JSON is standards-compliant."""
+    if obj is None:
+        return None
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (int, str, bool)):
+        return obj
+    if isinstance(obj, list):
+        return [sanitize_for_json(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    # numpy scalars / booleans
+    try:
+        import numpy as np
+        if isinstance(obj, (np.floating, np.integer)):
+            v = float(obj)
+            return v if math.isfinite(v) else None
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+    except Exception:
+        pass
+    return obj
 
 # ----------------------------- Token counting -----------------------------
 def count_tokens(text: str) -> int:
@@ -129,6 +155,7 @@ def chunk_table(
 ) -> Iterable[dict]:
     """
     Yield JSONL-ready records for the given DataFrame, chunked by rows to fit token budget, with overlap.
+    Produces STRICT-JSON-safe objects (NaN/Inf sanitized to None).
     """
     # Drop fully-empty rows/cols quickly
     df = df.dropna(how="all").dropna(axis=1, how="all")
@@ -149,14 +176,14 @@ def chunk_table(
     prefix_tok = count_tokens(prefix_text) + count_tokens(header_line(headers)) + 2  # small buffer
 
     # Compute rows per chunk to meet target tokens
-    rows_per_chunk = int(max(cfg.min_rows, min(cfg.max_rows, math.floor((cfg.target_tokens - prefix_tok) / max(1.0, per_row_tok)))))
+    rows_per_chunk = int(max(cfg.min_rows, min(cfg.max_rows,
+                          math.floor((cfg.target_tokens - prefix_tok) / max(1.0, per_row_tok)))))
     if rows_per_chunk < cfg.min_rows:
         rows_per_chunk = cfg.min_rows
 
     # Compute overlap in rows from desired token overlap
     overlap_rows = int(max(1, round(cfg.overlap_tokens / max(1.0, per_row_tok))))
-    # Ensure progress (avoid infinite loop)
-    if overlap_rows >= rows_per_chunk:
+    if overlap_rows >= rows_per_chunk:  # ensure progress
         overlap_rows = max(1, rows_per_chunk - 1)
 
     start = 0
@@ -171,7 +198,6 @@ def chunk_table(
 
         # If overshoot by a lot, shrink once
         if tok > (cfg.target_tokens + cfg.safety_margin) and (end - start) > cfg.min_rows:
-            # recompute rows using token ratio
             new_span = max(cfg.min_rows, int((cfg.target_tokens - prefix_tok) / max(1.0, per_row_tok)))
             end = min(n, start + new_span)
             text_block = header + "\n" + render_rows_to_text(headers, values[start:end])
@@ -193,27 +219,38 @@ def chunk_table(
             "chunk_index": chunk_idx,
             "llm_temperature": cfg.llm_temperature,
         }
+
         structured = {
             "headers": headers,
             "rows": values[start:end],
             "types": [str(df.dtypes[c]) for c in df.columns],
         }
 
+        # --- NEW: Strict-JSON sanitization ---
+        structured = sanitize_for_json(structured)
+
         # Stable ID over text + metadata
         h = hashlib.sha256((text_block + json.dumps(meta, sort_keys=True)).encode("utf-8")).hexdigest()
-        yield {
+
+        rec = {
             "id": f"sha256:{h}",
             "text": text_block,
-            "meta": meta,
+            "metadata": meta,          
             "structured": structured,
             "token_count": tok,
         }
+
+        # Final safety: sanitize full record (handles any lingering NaN/Inf)
+        rec = sanitize_for_json(rec)
+
+        yield rec
 
         chunk_idx += 1
         if end >= n:
             break
         # Slide forward with overlap
         start = max(0, end - overlap_rows)
+
 
 
 def read_excel_as_sheets(path: str) -> List[Tuple[str, Optional[str], pd.DataFrame]]:
