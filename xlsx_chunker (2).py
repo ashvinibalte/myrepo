@@ -232,13 +232,41 @@ def chunk_table(
         # Stable ID over text + metadata
         h = hashlib.sha256((text_block + json.dumps(meta, sort_keys=True)).encode("utf-8")).hexdigest()
 
-        rec = {
-            "id": f"sha256:{h}",
-            "text": text_block,
-            "metadata": meta,          
-            "structured": structured,
-            "token_count": tok,
-        }
+# Create a stable chunk id
+chunk_id = f"{Path(source_path).stem}-{sheet_name}-{(start+1)}-{end}-{h[:8]}"
+
+# Uploader-facing record
+rec = {
+    "rawContent": text_block,      # REQUIRED
+    "enhancedContext": "",         # REQUIRED (can be empty)
+    "metadata": {                  # REQUIRED object
+        "chunkId": chunk_id,       # REQUIRED
+        "fileUrl": f"file:///{source_path.replace('\\', '/')}",  # REQUIRED
+        "groupNames": [            # REQUIRED
+            Path(source_path).stem,
+            f"Sheet:{sheet_name}",
+        ],
+        # optional extras you may keep:
+        "sheet": sheet_name,
+        "tableName": table_name,
+        "rowRange": [start + 1, end],
+        "colRange": [1, len(headers)],
+        "hasMacros": has_macros,
+        "modifiedTime": modified_time,
+        "targetTokens": cfg.target_tokens,
+        "overlapTokens": cfg.overlap_tokens,
+        "approxRowsPerChunk": rows_per_chunk,
+        "approxOverlapRows": overlap_rows,
+        "chunkIndex": chunk_idx,
+        "llmTemperature": cfg.llm_temperature,
+        "structured": structured,   # keep the structured slice if useful
+        "extra": meta               # keep your original meta if useful
+    }
+}
+
+# strict-JSON sanitize & yield
+rec = sanitize_for_json(rec)
+yield rec
 
         # Final safety: sanitize full record (handles any lingering NaN/Inf)
         rec = sanitize_for_json(rec)
@@ -304,7 +332,8 @@ def xlsx_to_jsonl(
                 modified_time=modified_time,
                 cfg=cfg,
             ):
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n")
+
 
 
 def is_excel_file(p: Path) -> bool:
